@@ -895,6 +895,37 @@ function getSandboxInferenceConfig(model, provider = null, preferredInferenceApi
   return { providerKey, primaryModelRef, inferenceBaseUrl, inferenceApi, inferenceCompat };
 }
 
+/**
+ * Reject any value that would let an attacker break out of a Dockerfile
+ * ARG line. The substitution uses `dockerfile.replace(/^ARG FOO=.*$/m, ...)`
+ * which only matches a single line — if the replacement value contains a
+ * newline (or any other control character), the next line of the file
+ * becomes a new top-level Dockerfile directive (RUN, FROM, COPY, etc.) at
+ * `docker build` time. That is build-time RCE inside the build container.
+ *
+ * This guard is the last line of defense for ARG values that come from
+ * env vars (CHAT_UI_URL, NEMOCLAW_PROXY_HOST/PORT) or other paths where
+ * input may not have been sanitized upstream. It throws hard so the user
+ * gets a clear error during onboard rather than a silently-corrupted
+ * Dockerfile that builds a poisoned image.
+ */
+function assertSafeDockerArgValue(name, value) {
+  if (typeof value !== "string") {
+    throw new Error(
+      `Invalid ${name}: expected string, got ${typeof value}.`,
+    );
+  }
+  // Reject newlines (\n, \r) and any other ASCII control character.
+  // \x00-\x1f covers \t, \n, \r, \v, \f, etc.; \x7f is DEL.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(value)) {
+    throw new Error(
+      `Invalid ${name}: control characters are not allowed in Dockerfile ARG values. ` +
+        `This guard prevents build-time code injection via newline-broken ARG lines.`,
+    );
+  }
+}
+
 function patchStagedDockerfile(
   dockerfilePath,
   model,
@@ -906,8 +937,23 @@ function patchStagedDockerfile(
   messagingChannels = [],
   messagingAllowedIds = {},
 ) {
+  // Validate every value that gets interpolated into an ARG line. The
+  // existing #610 fix protected the Python RUN step but not the
+  // file-rewrite step that produces the staged Dockerfile in the first
+  // place. A newline in any of these values can break out of its ARG line
+  // and inject an arbitrary RUN/FROM/COPY directive that executes during
+  // `docker build`.
+  assertSafeDockerArgValue("CHAT_UI_URL", chatUiUrl);
+  assertSafeDockerArgValue("NEMOCLAW_MODEL", model);
+
   const { providerKey, primaryModelRef, inferenceBaseUrl, inferenceApi, inferenceCompat } =
     getSandboxInferenceConfig(model, provider, preferredInferenceApi);
+
+  assertSafeDockerArgValue("NEMOCLAW_PROVIDER_KEY", providerKey);
+  assertSafeDockerArgValue("NEMOCLAW_PRIMARY_MODEL_REF", primaryModelRef);
+  assertSafeDockerArgValue("NEMOCLAW_INFERENCE_BASE_URL", inferenceBaseUrl);
+  assertSafeDockerArgValue("NEMOCLAW_INFERENCE_API", inferenceApi);
+
   let dockerfile = fs.readFileSync(dockerfilePath, "utf8");
   dockerfile = dockerfile.replace(/^ARG NEMOCLAW_MODEL=.*$/m, `ARG NEMOCLAW_MODEL=${model}`);
   dockerfile = dockerfile.replace(
@@ -4159,6 +4205,7 @@ module.exports = {
   getNavigationChoice,
   getSandboxInferenceConfig,
   getInstalledOpenshellVersion,
+  assertSafeDockerArgValue,
   getRequestedModelHint,
   getRequestedProviderHint,
   getStableGatewayImageRef,

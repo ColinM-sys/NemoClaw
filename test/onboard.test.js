@@ -20,6 +20,7 @@ import {
   getFutureShellPathHint,
   getSandboxInferenceConfig,
   getInstalledOpenshellVersion,
+  assertSafeDockerArgValue,
   getRequestedModelHint,
   getRequestedProviderHint,
   getRequestedSandboxNameHint,
